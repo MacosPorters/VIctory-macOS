@@ -132,8 +132,8 @@ pub(crate) fn u64_at(data: &[u8], at: usize) -> Result<u64, ShaderError> {
         .ok_or(ShaderError::Malformed("truncated"))
 }
 
-/// Builds a container from parts (test helper).
-#[cfg(test)]
+/// Builds a container from parts: the header, the part table, then each
+/// part with its length. Tests that write containers a parser reads use it.
 pub fn build(parts: &[(FourCC, &[u8])]) -> Vec<u8> {
     let table = HEADER_SIZE + 4 * parts.len();
     let total = table + parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>();

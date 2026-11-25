@@ -347,9 +347,9 @@ fn account_frame(frame: u64) {
 /// The start of a present plane: frame token, then the plane's resources.
 #[repr(C)]
 pub(crate) struct Plane {
-    token: u64,
-    count: u32,
-    resources: *const This,
+    pub(crate) token: u64,
+    pub(crate) count: u32,
+    pub(crate) resources: *const This,
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.

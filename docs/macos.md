@@ -105,6 +105,57 @@ This was the "signed zero in minimums" difference listed here before. Each `v_mi
 
 `container::shader_hash` now writes the MD5 of the program into the `HASH` part. The minimum cases run under Wine again, and both tests pass in every order on an M5 Pro with D3DMetal 4.0 beta 3. Cache entries written under the old zero hash are never looked up again, so old caches need no cleaning.
 
+## Loader, memory and synthetic-shader coverage
+
+Three fixture suites cover what the first engineering sprint of the
+[release plan](m5-release-plan.md) asks for, each exercised under CrossOver
+Wine with D3DMetal on the 16 GB M5 (no game data anywhere in them).
+
+**Loader coverage** (`crates/victory-loader/tests/load_probe.rs` and
+`crates/victory-loader/tests/crash_log.rs`): named, ordinal and delayed
+imports, TLS callbacks, `DllMain`, and the crash report for a fault in
+mapped title code. The probe's imports of `GetTickCount` and the title
+DLL's export are rewritten into ordinal imports; the loader parses them,
+the resolver answers them (our override for the host API, the title DLL's
+export by its ordinal), and the probe's calls land where they did by
+name. A console-API import rewritten to an ordinal nothing implements is
+reported as `#n` and its call lands in the reporting stub, which pins
+how such an import is isolated today. A write through a null pointer in
+the mapped image reaches the unhandled-exception filter, which names
+the mapped copy (`victory-image-*.dll+offset`) and unwinds its frames
+through the unwind tables the Windows loader registered for it.
+
+**Memory callbacks** (`crates/victory-hle/tests/xmem_hooks.rs`): the
+stand-in title exports `__XMemAllocationHooks__` (as Grand Theft Auto VI
+does), and `XMemAlloc`/`XMemFree` reach them with the caller's exact
+arguments while `XMemAllocDefault`/`XMemFreeDefault` take the system
+path, honouring the alignment attribute and handing out blocks of our
+own.
+
+**Memory visibility** (`crates/victory-gpu/src/draw.rs`, the
+`memory_round_trips_after_map_fence_alias_and_reuse` test): a compute
+workload through the console device — the CPU writes a persistently
+mapped buffer, the GPU reads it through the console queue and fence,
+writes title memory back; the same bytes through a second resource over
+them (an alias) and again after the resource is released and the memory
+reused. Two distinct byte patterns per round so a stale read cannot
+pass.
+
+**Synthetic shaders** (`crates/victory-gpu/src/triangle.rs`): native
+GFX10 vertex and pixel programs packed into console containers (the
+format `victory_shader::native` documents, written as its own tests
+write it), translated by the ordinary title path. The pixel program
+interpolates two coordinates, loads a texture descriptor from the table
+at user-data dword 0, samples with the immediate sampler in s[8:11],
+and writes the texel to target 0; the vertex program passes the input
+assembler's position and coordinates on. The containers translate; the
+full draw through the console command list (the
+`render_and_verify_two_triangle_frames` test) is written and its state
+verified on the host (render target, vertex buffers, viewport, scissor
+all bound, the draw recorded and not dropped), but the rasterized output
+is the clear colour alone on D3DMetal 4.0 beta 3 — the test is ignored
+until that is chased down with the debug layer on hardware.
+
 ## Open differences under D3DMetal
 
 The merge of VIctory's changes up to 70564ae on 25 November 2026 brought new shader tests, and three of them find real differences in D3DMetal 4.0 beta 3 on an M4. The tests skip only those checks under Wine, so the rest of each test still runs.

@@ -458,8 +458,8 @@ pub(crate) extern "system" fn create_compute_x(
 /// type then its data, padded to 8 bytes.
 #[repr(C)]
 pub(crate) struct StreamDesc {
-    size: usize,
-    stream: *const u8,
+    pub(crate) size: usize,
+    pub(crate) stream: *const u8,
 }
 
 /// A subobject type's size (type included), and the stage it is if it is a
