@@ -38,9 +38,9 @@ enum Root {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct VertexView {
-    address: u64,
-    size: u32,
-    stride: u32,
+    pub(crate) address: u64,
+    pub(crate) size: u32,
+    pub(crate) stride: u32,
 }
 
 #[repr(C)]
@@ -1822,7 +1822,7 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 /// copied, textures moved to the state they need. `marked`: a shader's
 /// writes through the view mark their pages (every translated shader's do);
 /// the host's own (clears) do not.
-fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
+pub(crate) fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -2981,5 +2981,292 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
+    }
+
+    /// A buffer workload through the console device, as a title runs it:
+    /// the CPU writes a persistently mapped buffer, the GPU reads it and
+    /// writes title memory back, and the fence of the title's own queue
+    /// paces every step. Two distinct byte patterns per round, so a stale
+    /// read cannot accidentally pass; the GPU's bytes read back through a
+    /// second resource over the same memory (an alias), and the whole
+    /// round trip again after that resource is released and the memory
+    /// reused. Nothing here needs the Xbox GDK.
+    #[test]
+    fn memory_round_trips_after_map_fence_alias_and_reuse() {
+        use crate::object::slot;
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{
+            CreateEventW, INFINITE, WaitForSingleObject,
+        };
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null: This = std::ptr::null();
+        // The title's own queue, fence and command list. Where a queue's
+        // signal sits depends on its layout (another test may switch the
+        // device's while this runs).
+        let mut q = null;
+        let queue_iid = crate::object::guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        assert_eq!(
+            crate::queue::create(null, [0u32; 4].as_ptr().cast(), &queue_iid, &mut q),
+            S_OK
+        );
+        let signal = if crate::device::newer() { 0x80 } else { 0x70 };
+        let mut fence = null;
+        assert_eq!(
+            crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence),
+            S_OK
+        );
+        // SAFETY: a plain auto-reset event, ours.
+        let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null_mut()) };
+        assert!(!event.is_null(), "the fence's event");
+        let mut allocator = null;
+        let allocator_iid = crate::object::guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        let list_iid = crate::object::guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+            S_OK
+        );
+        let submitted = crate::list::host_list(list).expect("the list's host list");
+        let close = slot::<extern "system" fn(This) -> HRESULT>(list, 0x48);
+        let reset = slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50);
+        let execute = slot::<extern "system" fn(This, u32, *const This)>(q, 0x50);
+        let mark = slot::<extern "system" fn(This, This, u64) -> HRESULT>(q, signal);
+        let reach = slot::<extern "system" fn(This, u64, *mut std::ffi::c_void) -> HRESULT>(
+            fence, 0x48,
+        );
+
+        // The source buffer (its own memory, persistently mapped) and the
+        // destination: title memory with two resources over it, one the
+        // shaders write and its alias.
+        const LEN: usize = 256;
+        let src = buffer(LEN as u64);
+        let (src_map, _) = crate::resource::buffer_bytes(src).unwrap();
+        let memory = title_memory(64 << 10) as u64;
+        let at_address = |address: u64| {
+            let desc: [u32; 14] = [
+                1, 0, 0, 0, LEN as u32, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0,
+            ];
+            let mut out = null;
+            let iid = crate::object::guid(
+                0x696442be,
+                0xa72e,
+                0x4059,
+                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+            );
+            assert_eq!(
+                crate::resource::create_at_address(
+                    null,
+                    address,
+                    desc.as_ptr().cast(),
+                    0,
+                    std::ptr::null(),
+                    &iid,
+                    &mut out
+                ),
+                S_OK,
+                "a buffer resource at {address:#x}"
+            );
+            out
+        };
+        let (written, aliased) = (at_address(memory), at_address(memory));
+        let map_of = |r: This| crate::resource::buffer_bytes(r).unwrap().0;
+        let (written_map, aliased_map) = (map_of(written), map_of(aliased));
+        assert_eq!(written_map as u64, memory, "both resources map the same bytes");
+
+        // The workload: the source read structured, the destination written
+        // raw (Wine's HLSL compiler writes through raw views).
+        let (out, out_map) = host.shared_buffer(LEN as u64).unwrap();
+        let slots = Slots::new(4);
+        let srv_words: [u32; 10] = [0, 1, 0x1688, 0, 0, 0, 64, 4, 0, 0];
+        let uav_words: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 1, 0, 0];
+        let read_of = |r: This| View::Shader(r as usize, Some(srv_words));
+        let write_of = |r: This| View::Unordered(r as usize, 0, Some(uav_words));
+        let across = compile_cs(
+            r#"
+StructuredBuffer<uint> src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+cbuffer c : register(b0) { uint add; }
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    dst.Store(id.x * 4, src[id.x] + add);
+}
+"#,
+            &[
+                Param::Table(&[srv(0, 1), uav(0, 1)]),
+                Param::Constants { register: 0, count: 1 },
+            ],
+        );
+        let out_of = compile_cs(
+            r#"
+StructuredBuffer<uint> src : register(t0);
+RWByteAddressBuffer o : register(u0);
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    o.Store(id.x * 4, src[id.x]);
+}
+"#,
+            &[Param::Table(&[srv(0, 1)]), Param::Uav { register: 0 }],
+        );
+
+        // What the CPU wrote, as bytes.
+        let wrote = |map: *mut u8, base: u8| {
+            for k in 0..LEN {
+                // SAFETY: inside the buffer's mapping.
+                unsafe { map.add(k).write_volatile(base.wrapping_add((k * 3) as u8)) };
+            }
+        };
+        let bytes = |map: *mut u8| -> Vec<u8> {
+            (0..LEN)
+                // SAFETY: inside the buffer's mapping.
+                .map(|k| unsafe { map.add(k).read_volatile() })
+                .collect()
+        };
+        let pattern =
+            |base: u8| (0..LEN).map(|k| base.wrapping_add((k * 3) as u8)).collect::<Vec<u8>>();
+        // The first differing byte of `got` against `want`, if any.
+        let first_diff = |got: &[u8], want: &[u8]| {
+            got.iter()
+                .zip(want)
+                .position(|(g, w)| g != w)
+                .map(|at| {
+                    format!(
+                        "first differing byte at {at} of {}: got {:#04x}, want {:#04x}",
+                        got.len(),
+                        got[at],
+                        want[at]
+                    )
+                })
+        };
+        let matches = |what: &str, got: &[u8], want: &[u8]| {
+            if let Some(why) = first_diff(got, want) {
+                panic!("{what} after the submission: {why}");
+            }
+        };
+
+        // Records and submits the workload: the source's view refreshed
+        // from title memory, the destination's declared written, then the
+        // queue runs the list and the fence's wait ends when it has.
+        let mut round = 0u64;
+        let mut submit = |views: (&View, Option<&View>), out: Option<&ID3D12Resource>| {
+            round += 1;
+            if round > 1 {
+                assert_eq!(reset(list, allocator, null), S_OK, "the list resets");
+            }
+            readable(&submitted, &used(ResourceType::Srv), views.0, false);
+            if let Some(write) = views.1 {
+                readable(&submitted, &used(ResourceType::Uav), write, false);
+            }
+            // SAFETY: an open list, live objects of ours.
+            unsafe {
+                submitted.list.SetDescriptorHeaps(&[Some(slots.0.clone())]);
+                if views.1.is_some() {
+                    submitted.list.SetComputeRootSignature(&across.0);
+                    submitted.list.SetComputeRootDescriptorTable(0, slots.gpu(0));
+                    submitted.list.SetComputeRoot32BitConstants(1, 1, [0u32].as_ptr().cast(), 0);
+                    submitted.list.SetPipelineState(&across.1);
+                } else {
+                    submitted.list.SetComputeRootSignature(&out_of.0);
+                    submitted.list.SetComputeRootDescriptorTable(0, slots.gpu(0));
+                    submitted
+                        .list
+                        .SetComputeRootUnorderedAccessView(1, out.unwrap().GetGPUVirtualAddress());
+                    submitted.list.SetPipelineState(&out_of.1);
+                }
+                submitted.list.Dispatch(1, 1, 1);
+            }
+            assert_eq!(close(list), S_OK, "the list closes");
+            execute(q, 1, &list);
+            assert_eq!(mark(q, fence, round), S_OK, "the queue signals");
+            assert_eq!(reach(fence, round, event), S_OK, "the fence is waited on");
+            // SAFETY: our event, signalled by the fence.
+            assert_eq!(
+                unsafe { WaitForSingleObject(event, INFINITE) },
+                WAIT_OBJECT_0,
+                "the submission had completed"
+            );
+        };
+
+        // A CPU write reaches the GPU, and the GPU's answer reaches title
+        // memory, without any map or view being taken again.
+        wrote(src_map, 0x11);
+        slots.make(0, &read_of(src));
+        slots.make(1, &write_of(written));
+        submit((&read_of(src), Some(&write_of(written))), None);
+        matches(
+            "the GPU wrote the first pattern back",
+            &bytes(written_map),
+            &pattern(0x11),
+        );
+
+        // The same mapped buffer, rewritten: the second submission must
+        // read the second pattern, not what the first one saw.
+        wrote(src_map, 0x77);
+        submit((&read_of(src), Some(&write_of(written))), None);
+        matches(
+            "the GPU observed the second pattern",
+            &bytes(written_map),
+            &pattern(0x77),
+        );
+        matches(
+            "the alias's map shows the same bytes",
+            &bytes(aliased_map),
+            &pattern(0x77),
+        );
+
+        // The GPU's bytes, read back through the alias's own view by
+        // another dispatch: its copy was refreshed from the aliased
+        // memory, not left at what it held before.
+        slots.make(0, &read_of(aliased));
+        submit((&read_of(aliased), None), Some(&out));
+        matches(
+            "the alias's view served the GPU's bytes",
+            &bytes(out_map),
+            &pattern(0x77),
+        );
+
+        // The alias released and its memory reused by a fresh resource:
+        // the round trip works over it, with no state left from before.
+        let drop = slot::<extern "system" fn(This) -> u32>(aliased, 0x10);
+        assert_eq!(drop(aliased), 0, "the alias resource is released");
+        let fresh = at_address(memory);
+        wrote(src_map, 0x33);
+        slots.make(0, &read_of(src));
+        slots.make(1, &write_of(fresh));
+        submit((&read_of(src), Some(&write_of(fresh))), None);
+        matches(
+            "the reused memory round-trips",
+            &bytes(map_of(fresh)),
+            &pattern(0x33),
+        );
+        matches(
+            "the first resource's map shows them too",
+            &bytes(written_map),
+            &pattern(0x33),
+        );
+
+        // SAFETY: our event.
+        unsafe { CloseHandle(event) };
     }
 }
