@@ -1,0 +1,68 @@
+# VIctory on the 16 GB M5: offline release plan
+
+**Release objective.** A player with an Apple M5 (10-core CPU, 16 GB unified memory) supplies an unpacked, supported Xbox Series installation, launches from macOS, completes the offline campaign with working audio, controls and saves, and gets paced 30 fps at a documented 720p internal / 1080p output preset. A first interactive mission is the alpha milestone. A start-to-credits run and the frame-time gates below define the final build.
+
+**Baseline.** This plan starts at Mac fork commit `d6fc0620f53a5c9073b9d08d0910c8d6aa5d0bdf`. Reuse VIctory's x64 PE loader, Xbox API implementations, shader translator, Wine built from CodeWeavers source, Rosetta and D3DMetal. The fork already supports running outside the CrossOver app. Our work starts with verifying that combination on the base M5. Upstream reports 701 passing tests and 10 ignored on an M4. Those figures describe another machine and revision. All M5 milestones below are pending.
+
+**First supported title build.** Target the inspected Scarlett 1.0.2.1 installation. A prior local inventory counted 587 direct imports across 68 DLL names. It also found 19 of 104 package entries absent at the declared paths and a 385,875,968-byte zero-filled span in the shader archive. The recovered shader sample covered vertex and mesh stages. Optional content, sparse regions and missing required data need independent classification. The earlier boot trace came from another runtime. Record VIctory's first baseline from scratch.
+
+## Work order and evidence
+
+Host setup and package verification can start together. The loader, graphics and storage fixtures can run before a verified game is available. Retail boot depends on verified startup content and a functioning host. World rendering depends on boot, shaders, streaming and memory visibility. Performance estimates become actionable once the same interactive scene renders correctly twice.
+
+| Gate | Work and relevant code | Evidence required to close |
+|---|---|---|
+| 0. Identify inputs | Use the title's manifest and a trusted installation of the same version. Inventory required and optional paths, sizes and hashes locally. Verify startup, mission, world and shader archives. Confirm representative pixel and compute shader inputs alongside vertex and mesh inputs. | A per-path ledger explains every missing entry required for the intended installation. Unverified content blocks only the tests that depend on it. Keep files, captures and derived caches outside Git under the [asset policy](asset-policy.md). |
+| 1. Reproduce the host | Use [setup.sh](../setup.sh), [the launcher](../tools/macos/victory.sh) and [the Wine test runner](../tools/macos/test-wine.sh). Record the Mac model, OS build, power mode, Rosetta availability, Rust and Wine builds, D3DMetal version, prefix and fork SHA. Repeat from a fresh prefix. | The CLI loads its config, both test suites finish, and the report separates pass, fail, ignore and capability skips. Exercise a real D3DMetal device and record the selected adapter. Every new failure has a named reproducer. |
+| 2. Verify loader and allocator | Start with the existing [loader probe](../crates/victory-loader/tests/load_probe.rs). Check direct and delayed imports, ordinal resolution, TLS, exceptions and callbacks. Trace actual calls through [xmem](../crates/victory-hle/src/modules/xmem.rs), covering allocation, free, defaults and title hooks. | Synthetic guest returns expected callback results. Alignment is correct for exercised attributes. CPU writes reach a GPU read and GPU writes reach CPU readback after the correct fence. Repeat after remapping an alias and recycling a resource. A stale read, wrong owner or double free fails the gate. |
+| 3. Draw a known image | Use original fixtures with the [GPU layer](../crates/victory-gpu/src) to clear, draw a triangle, upload a texture and present. Compare selected pixels or a tolerance-bounded image. Change the scene between frames. Microsoft's SimpleTriangle is an optional independent check when a built Scarlett layout is available. | A clean run produces the expected colors and depth, the changed frame appears, and readback matches. Cover both Xbox command-list behavior and the presentation path. Retain a small synthetic regression for each discrepancy. |
+| 4. Validate shaders and streaming | In [victory-shader](../crates/victory-shader), test wave operations, atomics, bindings and mesh output against known results. Exercise texture layouts, indirect draws and pipeline-cache invalidation. In [victory-formats](../crates/victory-formats) and the [DirectStorage module](../crates/victory-hle/src/modules/dstorage.rs), test decompression, queue completion, cancellation and error propagation. | A compute fixture yields expected bytes, a textured draw yields expected pixels, and a mesh workload emits the right primitive count. Stream, evict and reload a known texture under load. Record the first failing stage and whether the input, translation, upload or draw first diverges. |
+| 5. Reach an interactive menu | Run the verified title root using [victory-game](../crates/victory-game) and [Xbox service modules](../crates/victory-hle/src/modules). Trace file requests, package mounting, user/profile events, controller input, async completions, intro playback and audio. Prioritize unresolved calls reached on the boot path. | Three cold launches from a clean first-run state reach a responsive menu. Accept first-run options, restart and verify they persist. Record the first failing operation and elapsed time for each failure. A movie or repeated loading screen is an intermediate result. |
+| 6. Reach playable alpha | Load the first mission. Inspect the first visibly wrong render pass locally, tracing descriptors, geometry, depth, materials, lighting, animation and HUD. Follow player movement across a streaming boundary and verify dialogue, input and checkpoint triggers. | Complete an on-foot sequence, drive into a new area, finish a mission, save, quit and continue from that save. Replaying from the same checkpoint produces equivalent scene content without persistent missing geometry, black frames or stale textures. |
+| 7. Fit the base M5 | Profile the release build in the three scenes below. Separate guest main/render thread, translated shader, GPU pass, queue waits, storage, shader compilation, residency and swap costs. Change one factor at a time and retain a correctness capture locally for each comparison. | Three runs meet the frame-time contract at the advertised preset. Record settings and cache state. A change that improves timing by dropping visible work fails. |
+| 8. Qualify the campaign | Track missions, transitions, checkpoints, cinematics, dialogue, fail/retry and progression saves. Exercise controller reconnect, focus loss, clean exit and recovery from an interrupted save using disposable copies. Restore old saves on an updated runtime. | Complete a start-to-credits offline playthrough on the release candidate. Re-run each repaired progression blocker from its nearest checkpoint. Record save compatibility, known cosmetic issues and coverage gaps. |
+| 9. Ship and reproduce | Package a versioned launcher and runtime with setup instructions, a compatibility manifest, checksums, notices and an uninstall path. Resolve distribution terms for each dependency. Keep Apple's separately supplied components and user game data local under their applicable terms. | A fresh macOS user can install, select the title folder, launch, play, save, update and roll back while preserving saves. Repeat the benchmark with the distributed build. Tag the exact tested commit and publish the supported host/title matrix with remaining limitations. |
+
+## First engineering sprint
+
+1. **Host baseline.** Run the existing commands below on the M5. Record ignored or skipped GPU tests by name and identify which critical paths they cover. Retain a clean prefix for reproduction.
+2. **Input verification.** Complete the local file ledger while the host builds. Use a public or self-authored fixture for any subsystem whose corresponding title data cannot yet be verified.
+3. **Memory round trip.** Inventory existing tests first. Add the smallest missing test for a CPU write after a persistent map, submit GPU work, wait for completion and check the bytes. Test the reverse direction and allocation reuse separately so the first mismatch has one likely cause.
+4. **First changing frame.** Run an original triangle with two distinct positions through the graphics path and capture both results. Split device creation, shader compilation, submission and presentation errors in the report.
+5. **First retail baseline.** With verified startup files, run once with diagnostics. Capture import provenance, first failed operation, last completed file request and last successful GPU submission locally. Select the next fix from that trace. Repeat on the release build after the fix.
+
+Use the [current configuration example](../victory.example.toml) and [Mac setup notes](macos.md). The existing development entry points from the repository root are:
+
+```sh
+./setup.sh
+tools/macos/victory.sh config
+cargo test --workspace
+WINE="$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine" \
+  WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=b" \
+  tools/macos/test-wine.sh --workspace --no-fail-fast
+```
+
+Set the game directory outside the checkout in the local configuration. Pass the full Wine-visible executable path to `tools/macos/victory.sh run --execute`. Use `VICTORY_DIAGNOSTICS=1` on a reproduction run. Benchmark with diagnostics disabled, recording only enough timing data to measure the run.
+
+## Frame-time contract
+
+Use a fixed 720p internal preset and 1080p output. Record scaling method, quality settings, power mode, display refresh and thermal state. Replay three recorded routes from known saves: a dense street on foot, fast driving across streaming boundaries, and a mission with dialogue and effects. Run the same sequence three times for at least 30 minutes per run. Include cold-cache first play and warm-cache repeats and publish both sets of numbers separately.
+
+| Metric | Release condition |
+|---|---|
+| Frame delivery | At least 29.7 distinct displayed frames/s overall and per scene. Count newly rendered frames reaching the display. Use moving-camera sections and sampled image changes to check for duplicate presents. |
+| Pacing | p95 displayed interval ≤35 ms, p99 ≤50 ms, no gameplay hitch above 100 ms. Declare loading boundaries in advance and report their duration separately. |
+| Memory | Log peak residency, memory pressure and swap trend on the 16 GB system. Repeated traversal settles to a bounded working set with no sustained severe memory pressure or allocation failure. |
+| Stability and fidelity | No crash, hang, progression loss or recurring missing pass in any measured route. Hold render resolution and scene content constant across comparisons. Record cold shader compilation stalls explicitly. |
+
+If the target is missed, attach evidence for the dominant cost. For GPU saturation compare per-pass GPU times and render-scale sensitivity. For synchronization or copies, count bytes and queue waits per frame. For streaming, correlate hitches with decompression, uploads and eviction. For CPU limits, sample the main thread and workers at the same checkpoint. Prototype a direct Metal path only for a measured blocker, compare it on the same fixture and scene, and keep it only if correctness and timings justify the maintenance. Reassess the preset or target hardware explicitly if a representative scene still exceeds the budget.
+
+## Release engineering and player flow
+
+- **Integrate upstream deliberately.** Record the parent SHA of each milestone. Bring upstream fixes in small batches and rerun the loader, memory and shader regressions after each batch. Keep generic fixes separable from title-version workarounds. Recheck build identity before enabling any version-specific workaround.
+- **Test in layers.** Run formatting, lint, asset policy and synthetic tests for runtime changes. Run GPU tests on a D3DMetal-capable Mac and the release gates on the physical base M5. For a Mac-specific mismatch, use the same synthetic input on Windows D3D12 when available. Keep expected pixels or bytes defined independently of the implementation under test.
+- **Make failures reproducible.** Track each blocker by title build, runtime SHA, gate, reproduction steps, first failing call, expected and observed result, and the smallest passing comparison. Keep local game captures, dumps, private paths and saves outside issue reports. Publish synthetic reproductions and aggregate measurements.
+- **Define the player experience.** First launch checks host compatibility and dependencies, locates the user's title folder, verifies the supported build and reports any required missing file. The player chooses the M5 preset and launches offline. Later launches reuse compatible shader caches. Saves live independently from caches, so clearing caches or downgrading the runtime preserves progress.
+- **Cut a release candidate.** Freeze the host dependency matrix and record build instructions. Verify on a clean account, exercise update and rollback, then rerun the three routes and the campaign regressions. Publish installation instructions, a change log, exact benchmark methodology and known issues with the tested artifact.
+
+The first estimate for completing the release should follow a correct, profiled interactive scene. Until then, gate evidence is the progress measure. A failed gate should produce a smaller reproducer or an input requirement that another contributor can act on.
