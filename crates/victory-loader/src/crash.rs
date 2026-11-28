@@ -51,6 +51,30 @@ static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new()
 /// Read before installing the exception handler.
 static LOG_FIRST_CHANCE_BREAKPOINTS: AtomicBool = AtomicBool::new(false);
 
+/// Diagnostics: title `int3` asserts to step over and resume, the way a
+/// debugger continues past one, to see how far init gets. Their RVAs in
+/// the title image, from `VICTORY_SKIP_TITLE_INT3=1dac734,...` (#24).
+/// Every other assert still stops the run.
+#[cfg(feature = "diagnostics")]
+static SKIP_TITLE_INT3: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+
+/// Diagnostics: on the first title `int3`, write the title's subsystem-registry
+/// state to files in this directory, so an assert that checks the registry can
+/// be read after the fact (the singleton, its tables, and their raw memory).
+/// From `VICTORY_DUMP_REGISTRY=<dir>` (#24).
+#[cfg(feature = "diagnostics")]
+static DUMP_REGISTRY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// The RVAs in a `VICTORY_SKIP_TITLE_INT3` list (hex, `0x` optional,
+/// comma-separated); entries that do not parse are left out.
+#[cfg(any(feature = "diagnostics", test))]
+fn skip_list(value: &str) -> Vec<u32> {
+    value
+        .split(',')
+        .filter_map(|v| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+        .collect()
+}
+
 /// Also appends every unhandled-exception report and panic to `file`, so a
 /// crash can be read after the console is gone.
 pub fn log_crashes_to(file: std::path::PathBuf) {
@@ -187,6 +211,14 @@ pub fn report_crashes() {
             && std::env::var_os("VICTORY_CRASH_BREAKPOINTS").is_some_and(|value| value == "1"),
         Ordering::Relaxed,
     );
+    #[cfg(feature = "diagnostics")]
+    SKIP_TITLE_INT3.get_or_init(|| {
+        std::env::var("VICTORY_SKIP_TITLE_INT3").map(|v| skip_list(&v)).unwrap_or_default()
+    });
+    #[cfg(feature = "diagnostics")]
+    if let Some(dir) = std::env::var_os("VICTORY_DUMP_REGISTRY") {
+        let _ = DUMP_REGISTRY.set(std::path::PathBuf::from(dir));
+    }
     // SAFETY: registers handlers that only read the exception they are
     // given; the title's own filter, once it sets one, takes the place of
     // ours and calls `report_unhandled` first.
@@ -553,6 +585,30 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
     // SAFETY: as above.
     let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
+    #[cfg(feature = "diagnostics")]
+    if code == EXCEPTION_BREAKPOINT && DUMP_REGISTRY.get().is_some() {
+        // SAFETY: the context record is valid for the faulting thread.
+        unsafe { dump_title_registry(&*(*info).ContextRecord) };
+    }
+    #[cfg(feature = "diagnostics")]
+    if code == EXCEPTION_BREAKPOINT
+        && let Some(list) = SKIP_TITLE_INT3.get()
+        && !list.is_empty()
+    {
+        // SAFETY: the context record is valid.
+        let rip = unsafe { (*(*info).ContextRecord).Rip } as usize;
+        if let Some(base) = crate::threads::title_image_base(rip)
+            && let Ok(rva) = u32::try_from(rip - base)
+            && list.contains(&rva)
+        {
+            // Logged every time, so a log never hides a patched run.
+            tracing::warn!(rva = format_args!("{rva:#x}"), "stepped over a title int3 (VICTORY_SKIP_TITLE_INT3)");
+            // Step over the one-byte `int3` and resume, the way a debugger
+            // continues past an assert. SAFETY: the context record is valid.
+            unsafe { (*(*info).ContextRecord).Rip += 1 };
+            return -1; // EXCEPTION_CONTINUE_EXECUTION
+        }
+    }
     if FATAL.contains(&code) {
         let to_file =
             code == EXCEPTION_BREAKPOINT && LOG_FIRST_CHANCE_BREAKPOINTS.load(Ordering::Relaxed);
@@ -750,6 +806,10 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
             // SAFETY: `rsp` is inside this thread's stack.
             context.Rip = unsafe { (rsp as *const u64).read() };
             context.Rsp += 8;
+        } else if !frame_register_inside(context, image, entry, low, high) {
+            // The unwind would read through it and fault (#50: the stack
+            // dump killed the process in `RtlVirtualUnwind2` reading 0x8).
+            break;
         } else {
             let (mut data, mut frame) = (null_mut(), 0);
             // SAFETY: `entry` belongs to `image`; the context is our copy.
@@ -771,6 +831,30 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
         }
         frames.push(context.Rip);
     }
+}
+
+/// Whether the frame register the function at `entry` unwinds through, if
+/// it has one, points into the stack `low..high`. Another thread caught in
+/// a prologue, or with a register cleared, can have it anywhere.
+fn frame_register_inside(
+    context: &CONTEXT,
+    image: u64,
+    entry: *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_RUNTIME_FUNCTION_ENTRY,
+    low: usize,
+    high: usize,
+) -> bool {
+    // SAFETY: `entry` is the loaded image's own table entry, and its unwind
+    // info (version and flags, prologue size, code count, frame register and
+    // offset) lies in that image.
+    let register = unsafe {
+        let info = (image as usize + (*entry).Anonymous.UnwindInfoAddress as usize) as *const u8;
+        info.add(3).read() & 0xf
+    };
+    let c = context;
+    let value = [
+        c.Rax, c.Rcx, c.Rdx, c.Rbx, c.Rsp, c.Rbp, c.Rsi, c.Rdi, c.R8, c.R9, c.R10, c.R11, c.R12, c.R13, c.R14, c.R15,
+    ][usize::from(register)] as usize;
+    register == 0 || (low..high).contains(&value)
 }
 
 /// `module+rva`, or the bare address.
@@ -841,9 +925,122 @@ fn memory_at(address: usize) -> String {
     }
 }
 
+/// Whether the page at `address` is committed and readable (so a read of it
+/// will not fault inside this handler).
+#[cfg(feature = "diagnostics")]
+fn page_readable(address: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: reads the address space's bookkeeping, not `address` itself.
+    let n = unsafe { VirtualQuery(address as *const _, &mut info, size_of_val(&info)) };
+    n != 0
+        && info.State == MEM_COMMIT
+        && info.Protect & PAGE_GUARD == 0
+        && info.Protect & 0xff != PAGE_NOACCESS
+}
+
+/// Reads up to `len` bytes from `address`, stopping at the first page that is
+/// not committed and readable, so a wild or partly-mapped pointer is safe.
+#[cfg(feature = "diagnostics")]
+fn read_guarded(address: usize, len: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut at = address;
+    while out.len() < len {
+        if !page_readable(at) {
+            break;
+        }
+        let take = ((at & !0xfff) + 0x1000).min(address + len) - at;
+        // SAFETY: `take` bytes from `at` stay inside a committed, readable page.
+        out.extend_from_slice(unsafe { std::slice::from_raw_parts(at as *const u8, take) });
+        at += take;
+    }
+    out
+}
+
+/// Reads a `usize` at `address`, or `None` if its page is not readable.
+#[cfg(feature = "diagnostics")]
+fn read_usize(address: usize) -> Option<usize> {
+    let bytes = read_guarded(address, 8);
+    (bytes.len() == 8).then(|| usize::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+/// On the first title `int3`, write the title's subsystem-registry state to
+/// files, so an assert that checks the registry can be understood after the
+/// fact. The guard at `image+0x1dac680` reads a singleton `*[image+0x7f00510]`
+/// with a main hash table (`+0x2b0`; descriptor `+0x30` cap / `+0x38` base)
+/// and a second table (`+0x2a8`; `+0x8` cap / `+0x10` base); the enforced id's
+/// 32-bit key is at `image+0x63011dc`. Reads only: no title code is called,
+/// every read is page-guarded, and it runs once.
+#[cfg(feature = "diagnostics")]
+unsafe fn dump_title_registry(context: &CONTEXT) {
+    use std::sync::atomic::AtomicBool;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    let Some(dir) = DUMP_REGISTRY.get() else {
+        return;
+    };
+    // The first title int3 is the registry assert; later ones add nothing.
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let Some(base) = crate::threads::title_image_base(context.Rip as usize) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(dir);
+    let mut txt = String::new();
+    let mut add = |l: String| {
+        eprintln!("  registry: {l}");
+        txt.push_str(&l);
+        txt.push('\n');
+    };
+    add(format!("image base {base:#x} (rip {:#x})", context.Rip));
+    let key = read_guarded(base + 0x63011dc, 4);
+    let key = (key.len() == 4).then(|| u32::from_le_bytes(key.try_into().unwrap()));
+    add(format!("enforced id key {key:#010x?}"));
+    let Some(g) = read_usize(base + 0x7f00510).filter(|&g| g != 0) else {
+        add("singleton *[image+0x7f00510] null or unreadable".into());
+        let _ = std::fs::write(dir.join("registry.txt"), &txt);
+        return;
+    };
+    add(format!("singleton G {g:#x}"));
+    let _ = std::fs::write(dir.join("g.bin"), read_guarded(g, 0x400));
+    // Main table: id present here means registered; descriptor at [G+0x2b0].
+    if let Some(desc) = read_usize(g + 0x2b0).filter(|&d| d != 0) {
+        let cap = read_usize(desc + 0x30).unwrap_or(0) & 0xffff_ffff;
+        let tbl = read_usize(desc + 0x38).unwrap_or(0);
+        add(format!("main desc {desc:#x} cap {cap} base {tbl:#x}"));
+        if tbl != 0 && (1..=0x10_0000).contains(&cap) {
+            let n = cap.saturating_mul(0x110).min(8 << 20);
+            let _ = std::fs::write(dir.join("main.bin"), read_guarded(tbl, n));
+        }
+    }
+    // Second table (`verify`'s deeper check): empty here means the id is
+    // declared but never activated.
+    if let Some(x) = read_usize(g + 0x2a8).filter(|&v| v != 0) {
+        let cap = read_usize(x + 0x8).unwrap_or(0) & 0xffff_ffff;
+        let tbl = read_usize(x + 0x10).unwrap_or(0);
+        add(format!("second {x:#x} cap {cap} base {tbl:#x}"));
+        if tbl != 0 && (1..=0x10_0000).contains(&cap) {
+            let n = cap.saturating_mul(0x110).min(8 << 20);
+            let _ = std::fs::write(dir.join("second.bin"), read_guarded(tbl, n));
+        }
+    } else {
+        add("second table [G+0x2a8] is null".into());
+    }
+    let _ = std::fs::write(dir.join("registry.txt"), &txt);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skip_lists_take_hex_rvas() {
+        assert_eq!(skip_list("1dac734, 0x2d5f3e2,zz,"), vec![0x1dac734, 0x2d5f3e2]);
+        assert!(skip_list("").is_empty());
+    }
     use windows_sys::Win32::System::Diagnostics::Debug::{
         EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
     };
@@ -870,6 +1067,25 @@ mod tests {
         // SAFETY: a non-null entry belongs to `image`, which the lookup wrote,
         // and `BeginAddress` is an offset into that image.
         Some(image + u64::from(unsafe { (*entry).BeginAddress }))
+    }
+
+    #[test]
+    fn an_off_stack_frame_register_ends_the_walk() {
+        use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_RUNTIME_FUNCTION_ENTRY;
+        // Unwind info at offset 0 of a fake image: version 1, no prologue or
+        // codes, frame register 5 (rbp).
+        let image = [1u8, 0, 0, 5];
+        let entry = IMAGE_RUNTIME_FUNCTION_ENTRY::default();
+        // SAFETY: zeroed is a valid CONTEXT.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        let stack = [0u64; 16];
+        let (low, high) = (stack.as_ptr() as usize, stack.as_ptr() as usize + size_of_val(&stack));
+        assert!(!frame_register_inside(&context, image.as_ptr() as u64, &entry, low, high), "rbp 0");
+        context.Rbp = (low + 64) as u64;
+        assert!(frame_register_inside(&context, image.as_ptr() as u64, &entry, low, high));
+        let none = [1u8, 0, 0, 0];
+        context.Rbp = 0;
+        assert!(frame_register_inside(&context, none.as_ptr() as u64, &entry, low, high), "no frame register");
     }
 
     #[test]
